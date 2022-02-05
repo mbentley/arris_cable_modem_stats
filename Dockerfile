@@ -1,4 +1,12 @@
-FROM python:3.8-alpine
+# start from upstream buildkit image & upgrade all packages
+FROM python:3.8-alpine AS upstream
+
+RUN apk --no-cache upgrade --purge
+
+# copy over the contents into a new image and add my customizations
+FROM scratch
+COPY --from=upstream / /
+LABEL maintainer="Matt Bentley <mbentley@mbentley.net>"
 
 ENV arris_stats_debug=False \
   destination=influxdb \
