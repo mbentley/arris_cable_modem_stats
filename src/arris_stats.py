@@ -15,7 +15,7 @@ import argparse
 import configparser
 import urllib3
 import requests
-
+import json
 
 # To add a new modem, add the model below
 # Create a new file src/arris_stats_themodel.py and a parse_html_themodel.py function
@@ -27,7 +27,8 @@ import requests
 # bash tests/run_tests.sh
 modems_supported = [
     'sb8200',
-    'sb6183'
+    'sb6183',
+    't25'
 ]
 
 
@@ -35,14 +36,10 @@ def main():
     """ MAIN """
 
     args = get_args()
-    init_logger(args.debug)
-
     config_path = args.config
     config = get_config(config_path)
 
-    # Re-init the logger if we set arris_stats_debug in ENV or config.ini
-    if config['arris_stats_debug']:
-        init_logger(True)
+    init_logger(args.log_level or config.get('log_level'))
 
     sleep_interval = int(config['sleep_interval'])
     destination = config['destination']
@@ -65,7 +62,8 @@ def main():
 
         if config['modem_auth_required']:
             while not token:
-                token = get_token(config, session)
+                token_func = config['get_token_function'] or get_token
+                token = token_func(config, session)
                 if not token and config['exit_on_auth_error']:
                     error_exit('Unable to authenticate with modem.  Exiting since exit_on_auth_error is True', config)
                 if not token:
@@ -94,12 +92,20 @@ def main():
             continue
 
         # Where should 6we send the results?
-        if destination == 'influxdb':
-            import arris_stats_influx  # pylint: disable=import-outside-toplevel
-            arris_stats_influx.send_to_influx(stats, config)
+        if destination == 'influxdb' and config['influx_major_version'] == 1:
+            import arris_stats_influx1  # pylint: disable=import-outside-toplevel
+            arris_stats_influx1.send_to_influx(stats, config)
+        elif destination == 'influxdb' and config['influx_major_version'] == 2:
+            import arris_stats_influx2  # pylint: disable=import-outside-toplevel
+            arris_stats_influx2.send_to_influx(stats, config)
         elif destination == 'timestream':
             import arris_stats_aws_timestream  # pylint: disable=import-outside-toplevel
             arris_stats_aws_timestream.send_to_aws_time_stream(stats, config)
+        elif destination == 'splunk':
+            import arris_stats_splunk  # pylint: disable=import-outside-toplevel
+            arris_stats_splunk.send_to_splunk(stats, config)
+        elif destination == 'stdout_json':
+            print(json.dumps(stats))
         else:
             error_exit('Destination %s not supported!  Aborting.' % destination, sleep=False)
 
@@ -109,7 +115,10 @@ def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', metavar='config_file_path', help='Path to config file', required=False)
     parser.add_argument('--debug', help='Enable debug logging', action='store_true', required=False, default=False)
+    parser.add_argument('--log-level', help='Set log_level', action='store', type=str.lower, required=False, choices=["debug", "info", "warning", "error"])
     args = parser.parse_args()
+    if args.debug:
+        args.log_level = "debug"
     return args
 
 
@@ -117,7 +126,7 @@ def get_default_config():
     return {
 
         # Main
-        'arris_stats_debug': False,
+        'log_level': "info",
         'destination': 'influxdb',
         'sleep_interval': 300,
         'modem_url': 'https://192.168.100.1/cmconnectionstatus.html',
@@ -132,6 +141,7 @@ def get_default_config():
         'sleep_before_exit': True,
 
         # Influx
+        'influx_major_version': 1,
         'influx_host': 'localhost',
         'influx_port': 8086,
         'influx_database': 'cable_modem_stats',
@@ -139,13 +149,25 @@ def get_default_config():
         'influx_password': None,
         'influx_use_ssl': False,
         'influx_verify_ssl': True,
+        'influx_org': None,
+        'influx_url': 'http://localhost:8086',
+        'influx_bucket': 'cable_modem_stats',
+        'influx_token': None,
 
         # AWS Timestream
         'timestream_aws_access_key_id': None,
         'timestream_aws_secret_access_key': None,
         'timestream_database': 'cable_modem_stats',
         'timestream_table': 'cable_modem_stats',
-        'timestream_aws_region': 'us-east-1'
+        'timestream_aws_region': 'us-east-1',
+
+        # Splunk
+        'splunk_token': None,
+        'splunk_host': None,
+        'splunk_port': 8088,
+        'splunk_ssl': False,
+        'splunk_verify_ssl': True,
+        'splunk_source': 'arris_cable_modem_stats'
     }
 
 
@@ -199,7 +221,10 @@ def get_config(config_path=None):
     # If you're adding new modems and get an error about no module, create src/arris_stats_yourmodel.py
     module = __import__('arris_stats_' + config['modem_model'])
     config['parse_html_function'] = getattr(module, 'parse_html_' + config['modem_model'])
-
+    try:
+        config['get_token_function'] = getattr(module, 'get_token_' + config['modem_model'])
+    except AttributeError:
+        config['get_token_function'] = None
     return config
 
 
@@ -318,14 +343,20 @@ def str_to_bool(string, name):
     raise ValueError('Config parameter % s should be boolean "true" or "false", but value is neither of those.' % name)
 
 
-def init_logger(debug=False):
+def init_logger(log_level="info"):
     """ Start the python logger """
     log_format = '%(asctime)s %(levelname)-8s %(message)s'
 
-    if debug:
+    level = logging.INFO
+
+    if log_level == "debug":
         level = logging.DEBUG
-    else:
+    elif log_level == "info":
         level = logging.INFO
+    elif log_level == "warning":
+        level = logging.WARNING
+    elif log_level == "error":
+        level = logging.ERROR
 
     # https://stackoverflow.com/a/61516733/866057
     try:
